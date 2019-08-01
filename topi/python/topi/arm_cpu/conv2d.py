@@ -23,7 +23,7 @@ import warnings
 import tvm
 from tvm import autotvm
 import tvm.contrib.nnpack
-
+from .. import nn
 from ..generic import schedule_conv2d_nchw, schedule_conv2d_winograd_without_weight_transform, \
                       schedule_conv2d_winograd_nnpack_without_weight_transform
 from ..util import traverse_inline, get_const_tuple
@@ -71,6 +71,8 @@ def conv2d_arm_cpu(cfg, data, kernel, strides, padding, dilation, layout, out_dt
     output : tvm.Tensor
         4-D with shape [batch, out_channel, out_height, out_width]
     """
+    if layout == "NHWC":
+        return nn.conv2d_nhwc(data, kernel, strides, padding, dilation, out_dtype)
     return _decl_spatial_pack(cfg, data, kernel, strides, padding, dilation, layout, out_dtype,
                               num_tile=2)
 
