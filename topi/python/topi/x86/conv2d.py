@@ -77,12 +77,23 @@ def _get_default_config(cfg, data, kernel, strides, padding, out_dtype, is_depth
         else:
             conv2d_avx_common._fallback_schedule(cfg, wkl)
 
+def _get_candidate_for_int8_schedule(min_multiplier, dimension):
+    candidate = list()
+    assert dimension % min_multiplier == 0
+    candidate.append([min_multiplier])
+    while 1:
+        next_candidate = candidate[-1][0] * 2
+        if next_candidate > dimension:
+            break
+        candidate.append([next_candidate])
+    return candidate
 
 def _create_tuning_space(cfg, data, kernel, strides, padding, dilation, layout):
     """Create schedule configuration from input arguments"""
     dshape = get_const_tuple(data.shape)
     kshape = get_const_tuple(kernel.shape)
     pat = re.compile(r'NCHW.+(\d+)c')
+    target = tvm.target.current_target(allow_none=False)
     if layout == 'NCHW':
         n, ic, h, w = dshape
         oc, _, kh, kw = kshape
@@ -91,11 +102,10 @@ def _create_tuning_space(cfg, data, kernel, strides, padding, dilation, layout):
         kh, kw, oc, _ = kshape
     elif pat.match(layout) is not None:
         n, ic_chunk, h, w, ic_bn = dshape
-        target = tvm.target.current_target(allow_none=False)
         if _is_int8_hw_support(data.dtype, kernel.dtype, target):
             oc_chunk, k_ic, kh, kw, k_ic_f, oc_bn, k_ic_s = kshape
             ic = ic_chunk*ic_bn
-            assert ic == k_ic*k_ic_f*kic_s
+            assert ic == k_ic*k_ic_f*k_ic_s
         else:
             oc_chunk, k_ic_chunk, kh, kw, k_ic_bn, oc_bn = kshape
             assert ic_chunk == k_ic_chunk
@@ -114,6 +124,15 @@ def _create_tuning_space(cfg, data, kernel, strides, padding, dilation, layout):
     # Create schedule config
     cfg.define_split("tile_ic", ic, num_outputs=2)
     cfg.define_split("tile_oc", oc, num_outputs=2)
+    if _is_int8_hw_support(data.dtype, kernel.dtype, target):
+        cfg.define_split('tile_ic', ic, policy='candidate',
+                         candidate=_get_candidate_for_int8_schedule(4, ic), num_outputs=1)
+        cfg.define_split('tile_oc', oc, policy='candidate',
+                         candidate=_get_candidate_for_int8_schedule(16, oc), num_outputs=1)
+    else:
+        cfg.define_split("tile_ic", ic, num_outputs=2)
+        cfg.define_split("tile_oc", oc, num_outputs=2)
+
     cfg.define_split("tile_ow", ow, num_outputs=2, filter=lambda y: y.size[-1] <= 64)
     if is_kernel_1x1:
         cfg.define_knob("tile_oh", [1, 2] if oh > 1 else [1])
@@ -395,12 +414,23 @@ def _topi_nn_conv2d_NCHWc(*args, **kwargs):
     # change shape with the value in config
     ic_bn, oc_bn, ow_bn = (cfg["tile_ic"].size[-1], cfg["tile_oc"].size[-1],
                            cfg["tile_ow"].size[-1])
-    new_data_shape = (raw_data_shape[0], raw_data_shape[1] // ic_bn,
-                      raw_data_shape[2], raw_data_shape[3], ic_bn)
+    target = tvm.target.current_target()
     data_layout = "NCHW%dc" % ic_bn
     out_layout = "NCHW%dc" % oc_bn
-    new_kernel_shape = (raw_kernel_shape[0] // oc_bn, raw_kernel_shape[1] // ic_bn,
-                        raw_kernel_shape[2], raw_kernel_shape[3], ic_bn, oc_bn)
+
+    new_data_shape = (raw_data_shape[0], raw_data_shape[1] // ic_bn,
+                      raw_data_shape[2], raw_data_shape[3], ic_bn)
+
+    if _is_int8_hw_support(data.dtype, kernel.dtype, target):
+        # Convert kernel data layout from 4D to 7D
+        n_elems = 4
+        new_kernel_shape = (raw_kernel_shape[0] // oc_bn, raw_kernel_shape[1] // ic_bn,
+                            raw_kernel_shape[2], raw_kernel_shape[3],
+                            ic_bn // n_elems, oc_bn, n_elems)
+    else:
+        new_kernel_shape = (raw_kernel_shape[0] // oc_bn, raw_kernel_shape[1] // ic_bn,
+                            raw_kernel_shape[2], raw_kernel_shape[3], ic_bn, oc_bn)
+
     new_data = tvm.placeholder(new_data_shape, data.dtype)
     new_kernel = tvm.placeholder(new_kernel_shape, kernel.dtype)
 
@@ -493,9 +523,9 @@ def _alter_conv2d_layout(attrs, inputs, tinfo, F):
             kernel_OIHWioe = F.transpose(kernel_OHWoIie, axes=(0, 4, 1, 2, 5, 3, 6))
             copy_inputs = [data_expr, kernel_OIHWioe]
             # Store altered operator's config
-            new_kernel = tvm.placeholder((out_channel//oc_bn, kh, kw, oc_bn,
-                                          in_channel//ic_bn, ic_bn//n_elems,
-                                          n_elems))
+            new_kernel = tvm.placeholder((out_channel // oc_bn, in_channel // ic_bn,
+                                          kh, kw, ic_bn // n_elems, oc_bn, n_elems),
+                                         dtype=kernel.dtype)
             new_workload = autotvm.task.args_to_workload(
                 [new_data, new_kernel, strides, padding, dilation,
                  new_attrs[layout_name], new_attrs['out_layout'], out_dtype],
