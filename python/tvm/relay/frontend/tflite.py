@@ -447,7 +447,25 @@ class OperatorConverter(object):
             rhs_type_str = self.get_tensor_type_str(rhs_tensor.tensor.Type())
             rhs_expr = self.exp_tab.new_const(self.get_tensor_value(rhs_tensor),
                                               dtype=rhs_type_str)
-        out = relay_op(lhs_expr, rhs_expr)
+
+        output_tensors = self.get_output_tensors(op)
+        assert len(output_tensors) == 1, "output tensors length should be 1"
+        output_tensor = output_tensors[0]
+        output_tensor_type = output_tensor.tensor.Type()
+        output_tensor_type_str = self.get_tensor_type_str(output_tensor_type)
+
+        if output_tensor.qnn_params is None:
+            out = relay_op(lhs_expr, rhs_expr)
+        else:
+            op_code_str = self.get_op_code_str(op)
+            if op_code_str == "ADD":
+                out = _qnn.op.add(lhs_expr, rhs_expr,
+                                  lhs_scale=lhs_tensor.qnn_params['scale'],
+                                  lhs_zero_point=lhs_tensor.qnn_params['zero_point'],
+                                  rhs_scale=rhs_tensor.qnn_params['scale'],
+                                  rhs_zero_point=rhs_tensor.qnn_params['zero_point'],
+                                  output_scale=output_tensor.qnn_params['scale'],
+                                  output_zero_point=output_tensor.qnn_params['zero_point'])
 
         # Options (fused_activation_function)
         options = None
@@ -466,7 +484,13 @@ class OperatorConverter(object):
             fused_activation_fn = options.FusedActivationFunction()
             # if we have activation fn
             if fused_activation_fn != ActivationFunctionType.NONE:
-                out = self.convert_fused_activation_function(out, fused_activation_fn)
+                if output_tensor.qnn_params is None:
+                    out = self.convert_fused_activation_function(out, fused_activation_fn)
+                else:
+                    out = self.convert_quantized_fused_activation(out, fused_activation_fn,
+                                                                  input_scale=output_tensor.qnn_params['scale'],
+                                                                  input_zero_point=output_tensor.qnn_params['zero_point'],
+                                                                  input_dtype=output_tensor_type_str)
 
         return out
 
@@ -1196,6 +1220,7 @@ def from_tflite(model, shape_dict, dtype_dict):
         func = relay.Function(relay.analysis.free_vars(outputs), outputs)
         mod = relay.Module.from_expr(func)
         mod = relay.transform.Legalize()(mod)
+        mod = relay.qnn.transform.QnnLower()(mod)
         func = mod["main"]
         return _module.Module.from_expr(func), params
     else:

@@ -549,3 +549,94 @@ def conv2d(data,
                         strides, padding, dilation,
                         groups, channels, kernel_size,
                         data_layout, kernel_layout, out_layout, out_dtype)
+
+
+def add(lhs, rhs, lhs_scale, lhs_zero_point, rhs_scale, rhs_zero_point, output_scale,
+        output_zero_point):
+    """Quantized addition with numpy-style broadcasting.
+    Parameters
+    ----------
+    lhs : relay.Expr
+        The left hand side quantized input data.
+    rhs : relay.Expr
+        The right hand side quantized input data.
+    lhs_scale: float
+        The scale of the lhs quantized expr.
+    lhs_zero_point: int
+       The zero point of lhs quantized expr.
+    rhs_scale: float
+        The scale of the rhs quantized expr.
+    rhs_zero_point: int
+       The zero point of rhs quantized expr.
+    output_scale: float
+        The scale of the output quantized expr.
+    output_zero_point: int
+       The zero point of output quantized expr.
+    Returns
+    -------
+    result : relay.Expr
+        The computed result.
+    """
+
+    # Find the dtype of the input expr. This is required for the requantize op. Since, this is
+    # add op, the dtype of the input is same as dtype of the output.
+    data0 = relay.transform.infer_type(lhs)
+    in_dtype = data0.checked_type.dtype
+
+    # First, check if the qnn params of lhs and rhs match. If yes, we can avoid one requantize by
+    # calling add first and then requantize. The whole process can be represented as follows
+    #
+    #          scale_c * (Q_c - zp_c) = scale * (Q_a - zp) + scale * (Q_b - zp)
+    #          scale_c * (Q_c - zp_c) = scale * (Q_a + Q_b - zp - zp)
+    #
+    # RHS looks like a quantized tensor with scale = scale, and zero_point = zp + zp
+    # This can be handled by first subtracting the zero point, followed by requantize with the
+    # output qnn params.
+
+    if lhs_scale == rhs_scale and lhs_zero_point == rhs_zero_point:
+        out = relay.add(lhs, rhs)
+        out = relay.subtract(out, relay.const(lhs_zero_point, dtype=in_dtype))
+        if lhs_scale != output_scale or lhs_zero_point != output_zero_point:
+            out = requantize(data=out,
+                             input_scale=lhs_scale,
+                             input_zero_point=lhs_zero_point,
+                             output_scale=output_scale,
+                             output_zero_point=output_zero_point,
+                             out_dtype=in_dtype)
+        return out
+
+    # Since the input qnn params can be different than output qnn params, we first requantize the
+    # input tensors to the output qnn params. Then we call relay.add on the requantized inputs. This
+    # addition results in extra addition of the output zero point. We futher subtract the zero
+    # point. The whole process can be represented using following equations
+    #
+    #          scale_c * (Q_c - zp_c) = scale_a * (Q_a - zp_a) + scale_b * (Q_b - zp_b)
+    #
+    # After requantizing Q_a and Q_b, equation becomes,
+    #          scale_c * (Q_c - zp_c) = scale_c * (Q_a' - zp_c) + scale_c * (Q_b' - zp_c)
+    #          scale_c * (Q_c - zp_c) = scale_c * (Q_a' + Q_b' - zp_c - zp_c)
+    #
+    # Comparing the LHS and RHS, it results in
+    #          Q_c = Q_a' + Q_b' - zp_c
+
+    requantized_lhs = lhs
+    if lhs_scale != output_scale or lhs_zero_point != output_zero_point:
+        requantized_lhs = requantize(data=lhs,
+                                     input_scale=lhs_scale,
+                                     input_zero_point=lhs_zero_point,
+                                     output_scale=output_scale,
+                                     output_zero_point=output_zero_point,
+                                     out_dtype=in_dtype)
+
+    requantized_rhs = rhs
+    if rhs_scale != output_scale or rhs_zero_point != output_zero_point:
+        requantized_rhs = requantize(data=rhs,
+                                     input_scale=rhs_scale,
+                                     input_zero_point=rhs_zero_point,
+                                     output_scale=output_scale,
+                                     output_zero_point=output_zero_point,
+                                     out_dtype=in_dtype)
+
+    out = relay.add(requantized_lhs, requantized_rhs)
+    out = relay.subtract(out, relay.const(output_zero_point, dtype=in_dtype))
+    return out
