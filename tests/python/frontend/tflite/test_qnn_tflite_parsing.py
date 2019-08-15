@@ -6,17 +6,17 @@ import numpy as np
 import tflite.Model
 import time
 
-# tflite_model_file = "test_models/inception_v1_224_quant.tflite"
+tflite_model_file = "test_models/inception_v1_224_quant.tflite"
 # tflite_model_file = "test_models/inception_v2_224_quant.tflite"
-tflite_model_file = "test_models/inception_v3_299_quant.tflite"
+# tflite_model_file = "test_models/inception_v3_299_quant.tflite"
 # tflite_model_file = "test_models/inception_v4_299_quant.tflite"
 # tflite_model_file = "test_models/mobilenet_v2_1.0_224_quant.tflite"
 # tflite_model_file = "test_models/inception_v3_299.tflite"
 # tflite_model_file = "test_models/inception_v4_299.tflite"
 # tflite_model_file = "test_models/mobilenet_v2_1.0_224.tflite"
 
-# input_shape = (1, 224, 224, 3)
-input_shape = (1, 299, 299, 3)
+input_shape = (1, 224, 224, 3)
+# input_shape = (1, 299, 299, 3)
 
 dtype = 'uint8'
 # dtype = 'float32'
@@ -54,6 +54,13 @@ shape_dict = {input_tensor: input_shape}
 tflite_model_buf = open(tflite_model_file, "rb").read()
 tflite_model = tflite.Model.Model.GetRootAsModel(tflite_model_buf, 0)
 
+answer = dict()
+with open("test_images/answer.txt", "r") as f:
+    for line in f:
+        blocks = line.split(":")
+        text = blocks[1].split("\n")
+        answer[int(blocks[0])] = text[0]
+
 t1 = current_milli_time()
 mod, params = relay.frontend.from_tflite(tflite_model,
                                          shape_dict={input_tensor: input_shape},
@@ -69,23 +76,26 @@ t2 = current_milli_time()
 print("Build quantized model: {} ms".format(t2 - t1))
 
 module = runtime.create(graph, lib, tvm.cpu())
+print("Evaluate inference time cost...")
+ftimer = module.module.time_evaluator("run", ctx, number=30, repeat=3)
+prof_res = np.array(ftimer().results) * 1000  # convert to millisecond
+print("Mean inference time (std dev): %.2f ms (%.2f ms)" %
+      (np.mean(prof_res), np.std(prof_res)))
+
 for idx, data in enumerate(preprocessed_data):
     module.set_input(input_tensor, tvm.nd.array(data))
     module.set_input(**params)
-
-    print("Evaluate inference time cost...")
-    ftimer = module.module.time_evaluator("run", ctx, number=30, repeat=3)
-    prof_res = np.array(ftimer().results) * 1000  # convert to millisecond
-    print("Mean inference time (std dev): %.2f ms (%.2f ms)" %
-          (np.mean(prof_res), np.std(prof_res)))
-
     module.run()
     tvm_output = module.get_output(0).asnumpy()
     predictions = np.squeeze(tvm_output)
+    print("\n")
     print("file name: {}".format(img_paths[idx]))
+    top3 = predictions.argsort()[-3:][::-1] - 1
+    print("*** top 3 ***")
     print("max value: {}".format(np.max(predictions)))
-    print("max index: {}".format(str(np.argmax(predictions) - 1)))
-    print("top 3 indices")
-    print((predictions.argsort()[-3:][::-1] - 1))
+    print(str(top3[0]) + ": " + answer[top3[0]])
+    print(str(top3[1]) + ": " + answer[top3[1]])
+    print(str(top3[2]) + ": " + answer[top3[2]])
+
 
 
